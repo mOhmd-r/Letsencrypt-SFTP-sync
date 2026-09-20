@@ -1,0 +1,23 @@
+# Local target lists
+targets.txt
+targets.local
+*.targets
+
+# Secrets / SSH material
+*.pem
+*.key
+id_rsa
+id_ed25519
+known_hosts
+
+# Archives and runtime files
+*.tar
+*.tar.gz
+*.tgz
+*.log
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
