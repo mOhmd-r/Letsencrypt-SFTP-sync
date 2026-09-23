@@ -20,6 +20,7 @@ SFTP_REQUESTS="${SFTP_REQUESTS:-128}"
 
 # Strong compression is useful when the network is slower than local CPU.
 GZIP_LEVEL="${GZIP_LEVEL:-9}"
+RELOAD_SERVICE="${RELOAD_SERVICE:-}"
 
 IPS_FILE="${1:-}"
 
@@ -72,6 +73,7 @@ Optional environment overrides:
   SFTP_BUFFER_SIZE
   SFTP_REQUESTS
   GZIP_LEVEL
+  RELOAD_SERVICE        Optional systemd unit reloaded after an atomic swap
 
 EOF
 }
@@ -89,7 +91,10 @@ SSH_OPTIONS=(
     -o IPQoS=throughput
     -o ForwardAgent=no
     -o ClearAllForwardings=yes
-    -o PreferredAuthentications=publickey,keyboard-interactive,password
+    -o BatchMode=yes
+    -o PasswordAuthentication=no
+    -o KbdInteractiveAuthentication=no
+    -o PreferredAuthentications=publickey
 )
 
 open_ssh_connection() {
@@ -249,6 +254,7 @@ sync_host() {
     local host
     local port
     local target
+    local host_lookup
 
     local remote_tmp_dir
     local remote_archive
@@ -258,7 +264,7 @@ sync_host() {
     SUDO_PASSWORD=""
     CONTROL_SOCKET=""
 
-    if [[ ! "$line" =~ ^[^@[:space:]]+@[^:[:space:]]+:[0-9]+$ ]]; then
+    if [[ ! "$line" =~ ^[A-Za-z_][A-Za-z0-9._-]*@[A-Za-z0-9._-]+:[0-9]+$ ]]; then
         echo -e "${RED}❌ Invalid target:${NC} $line"
         echo "   Expected: user@host:port"
         return 1
@@ -268,7 +274,18 @@ sync_host() {
     hostport="${line#*@}"
     host="${hostport%%:*}"
     port="${hostport##*:}"
+    if (( port < 1 || port > 65535 )); then
+        echo -e "${RED}❌ Invalid SSH port:${NC} $port"
+        return 1
+    fi
     target="$user@$host"
+    host_lookup="$host"
+    [[ "$port" == "22" ]] || host_lookup="[$host]:$port"
+
+    if ! ssh-keygen -F "$host_lookup" -f "$KNOWN_HOSTS" >/dev/null; then
+        echo -e "${RED}❌ No pinned host key for:${NC} $host_lookup"
+        return 1
+    fi
 
     echo
     echo "============================================================"
@@ -288,7 +305,9 @@ sync_host() {
         "command -v sudo >/dev/null &&
          command -v tar >/dev/null &&
          command -v sha256sum >/dev/null &&
-         command -v mktemp >/dev/null"; then
+         command -v mktemp >/dev/null &&
+         command -v realpath >/dev/null &&
+         command -v openssl >/dev/null"; then
 
         echo -e "  ${RED}❌ Required remote commands are missing${NC}"
         close_ssh_connection "$target" "$port"
@@ -397,19 +416,103 @@ sync_host() {
 
     echo "  📦 Installing certificates..."
 
+    local certs_q archive_q hash_q reload_q
+    printf -v certs_q '%q' "$CERTS_DIR"
+    printf -v archive_q '%q' "$remote_archive"
+    printf -v hash_q '%q' "$ARCHIVE_SHA256"
+    printf -v reload_q '%q' "$RELOAD_SERVICE"
+
     if ! remote_sudo \
         "$target" \
         "$port" \
         "
-        mkdir -p '$CERTS_DIR' &&
-        tar \
-            -xzf '$remote_archive' \
-            -C '$CERTS_DIR' \
-            --overwrite \
-            --numeric-owner &&
-        test -d '$CERTS_DIR/live' &&
-        test -d '$CERTS_DIR/archive' &&
-        test -d '$CERTS_DIR/renewal'
+        set -Eeuo pipefail
+        umask 077
+        certs_dir=$certs_q
+        source_archive=$archive_q
+        expected_hash=$hash_q
+        reload_service=$reload_q
+        parent=\$(dirname \"\$certs_dir\")
+        base=\$(basename \"\$certs_dir\")
+        work=\$(mktemp -d \"\${parent}/.\${base}.work.XXXXXXXX\")
+        stage=\$(mktemp -d \"\${parent}/.\${base}.stage.XXXXXXXX\")
+        root_archive=\"\$work/source.tar.gz\"
+        old=\"\${parent}/.\${base}.previous.\$\$\"
+        installed=false
+        had_previous=false
+
+        rollback() {
+            status=\$?
+            if [[ \$status -ne 0 && \"\$installed\" == true ]]; then
+                rm -rf -- \"\$certs_dir\"
+                if [[ \"\$had_previous\" == true && -d \"\$old\" && ! -L \"\$old\" ]]; then
+                    mv -- \"\$old\" \"\$certs_dir\" || true
+                fi
+                if [[ \"\$had_previous\" == true && -n \"\$reload_service\" ]]; then
+                    systemctl reload \"\$reload_service\" >/dev/null 2>&1 || true
+                fi
+            fi
+            [[ -e \"\$stage\" ]] && rm -rf -- \"\$stage\"
+            [[ -e \"\$work\" ]] && rm -rf -- \"\$work\"
+            exit \$status
+        }
+        trap rollback EXIT
+
+        install -o root -g root -m 600 -- \"\$source_archive\" \"\$root_archive\"
+        printf '%s  %s\\n' \"\$expected_hash\" source.tar.gz > \"\$work/SHA256SUMS\"
+        (cd \"\$work\" && sha256sum --strict -c SHA256SUMS)
+
+        while IFS= read -r member; do
+            [[ \"\$member\" != /* ]] || exit 41
+            case \"/\$member/\" in */../*) exit 42 ;; esac
+        done < <(tar -tzf \"\$root_archive\")
+
+        tar -xzf \"\$root_archive\" -C \"\$stage\" --no-same-owner --same-permissions
+        chmod -R u-s,g-s \"\$stage\"
+        rm -rf -- \"\$work\"
+        work=''
+
+        test -d \"\$stage/live\"
+        test -d \"\$stage/archive\"
+        test -d \"\$stage/renewal\"
+        unexpected=\$(find \"\$stage\" ! -type f ! -type d ! -type l -print -quit)
+        [[ -z \"\$unexpected\" ]]
+        while IFS= read -r link; do
+            resolved=\$(realpath -m \"\$link\")
+            case \"\$resolved\" in \"\$stage\"/*) ;; *) exit 43 ;; esac
+        done < <(find \"\$stage\" -type l -print)
+
+        found_certificate=false
+        for fullchain in \"\$stage\"/live/*/fullchain.pem; do
+            [[ -e \"\$fullchain\" ]] || continue
+            found_certificate=true
+            cert_dir=\$(dirname \"\$fullchain\")
+            privkey=\"\$cert_dir/privkey.pem\"
+            test -f \"\$fullchain\"
+            test -f \"\$privkey\"
+            openssl x509 -checkend 0 -noout -in \"\$fullchain\" >/dev/null
+            openssl pkey -check -noout -in \"\$privkey\" >/dev/null
+            cert_pub=\$(openssl x509 -in \"\$fullchain\" -pubkey -noout | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum)
+            key_pub=\$(openssl pkey -in \"\$privkey\" -pubout -outform DER 2>/dev/null | sha256sum)
+            [[ \"\${cert_pub%% *}\" == \"\${key_pub%% *}\" ]]
+        done
+        [[ \"\$found_certificate\" == true ]]
+
+        if [[ -e \"\$certs_dir\" ]]; then
+            [[ -d \"\$certs_dir\" && ! -L \"\$certs_dir\" ]]
+            [[ ! -e \"\$old\" ]]
+            mv -- \"\$certs_dir\" \"\$old\"
+            had_previous=true
+        fi
+        mv -- \"\$stage\" \"\$certs_dir\"
+        stage=''
+        installed=true
+        if [[ -n \"\$reload_service\" ]]; then
+            systemctl reload \"\$reload_service\"
+        fi
+        [[ -z \"\$old\" || ! -e \"\$old\" ]] || rm -rf -- \"\$old\"
+        installed=false
+        trap - EXIT
         "; then
 
         echo -e "  ${RED}❌ Certificate installation failed${NC}"
@@ -426,8 +529,8 @@ sync_host() {
         return 1
     fi
 
-    echo "  ✔ Certificates installed"
-    echo "  ✔ Let's Encrypt structure verified"
+    echo "  ✔ Certificates installed atomically"
+    echo "  ✔ Certificate/key pairs verified"
 
     remote_ssh \
         "$target" \
@@ -469,19 +572,19 @@ if [[ ! -r "$IPS_FILE" ]]; then
     exit 1
 fi
 
-if [[ ! -d "$CERTS_DIR" ]]; then
+if [[ ! "$CERTS_DIR" =~ ^/[A-Za-z0-9._/-]+$ || "$CERTS_DIR" == *..* || "$CERTS_DIR" == "/" || ! -d "$CERTS_DIR" || -L "$CERTS_DIR" ]]; then
     echo -e "${RED}❌ Let's Encrypt directory not found:${NC}"
     echo "  $CERTS_DIR"
     exit 1
 fi
 
-if [[ ! -f "$SSH_KEY" ]]; then
+if [[ ! -f "$SSH_KEY" || -L "$SSH_KEY" ]]; then
     echo -e "${RED}❌ SSH private key not found:${NC}"
     echo "  $SSH_KEY"
     exit 1
 fi
 
-if [[ ! -f "$KNOWN_HOSTS" ]]; then
+if [[ ! -f "$KNOWN_HOSTS" || -L "$KNOWN_HOSTS" ]]; then
     echo -e "${RED}❌ SSH known_hosts not found:${NC}"
     echo "  $KNOWN_HOSTS"
     echo
@@ -489,14 +592,36 @@ if [[ ! -f "$KNOWN_HOSTS" ]]; then
     exit 1
 fi
 
-for cmd in ssh sftp tar gzip sha256sum mktemp; do
+[[ -z "$RELOAD_SERVICE" || "$RELOAD_SERVICE" =~ ^[A-Za-z0-9_.@-]+$ ]] || {
+    echo -e "${RED}❌ Invalid systemd unit name: $RELOAD_SERVICE${NC}"
+    exit 1
+}
+
+for cmd in ssh sftp ssh-keygen tar gzip sha256sum mktemp stat; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
         echo -e "${RED}❌ Required command missing: $cmd${NC}"
         exit 1
     fi
 done
 
-chmod 600 "$SSH_KEY"
+key_owner="$(stat -c '%u' "$SSH_KEY")"
+known_hosts_owner="$(stat -c '%u' "$KNOWN_HOSTS")"
+[[ "$key_owner" == "0" || -n "${SUDO_UID:-}" && "$key_owner" == "$SUDO_UID" ]] || {
+    echo -e "${RED}❌ SSH key must be owned by root or the invoking sudo user.${NC}"
+    exit 1
+}
+[[ "$known_hosts_owner" == "0" || -n "${SUDO_UID:-}" && "$known_hosts_owner" == "$SUDO_UID" ]] || {
+    echo -e "${RED}❌ known_hosts must be owned by root or the invoking sudo user.${NC}"
+    exit 1
+}
+(( (8#$(stat -c '%a' "$SSH_KEY") & 8#077) == 0 )) || {
+    echo -e "${RED}❌ SSH private key must not be accessible by group or others.${NC}"
+    exit 1
+}
+(( (8#$(stat -c '%a' "$KNOWN_HOSTS") & 8#022) == 0 )) || {
+    echo -e "${RED}❌ known_hosts must not be group- or world-writable.${NC}"
+    exit 1
+}
 
 TMP_DIR="$(mktemp -d)"
 chmod 700 "$TMP_DIR"
@@ -516,6 +641,11 @@ tar \
     -cf - \
     . |
 gzip "-$GZIP_LEVEL" > "$ARCHIVE"
+
+while IFS= read -r member; do
+    [[ "$member" != /* ]] || { echo -e "${RED}❌ Archive contains an absolute path.${NC}"; exit 1; }
+    case "/$member/" in */../*) echo -e "${RED}❌ Archive contains a parent path.${NC}"; exit 1 ;; esac
+done < <(tar -tzf "$ARCHIVE")
 
 chmod 600 "$ARCHIVE"
 

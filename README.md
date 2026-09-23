@@ -10,13 +10,16 @@ The project is designed for small infrastructure environments where certificates
 - Uses **SFTP over SSH** for transport.
 - Reuses a single SSH ControlMaster connection per target.
 - Uses strict SSH host-key verification.
-- Supports SSH key authentication with normal OpenSSH password fallback.
+- Requires public-key SSH authentication; password and keyboard-interactive SSH login are disabled.
 - Detects passwordless remote `sudo`.
 - If remote `sudo` needs a password, reads it interactively from `/dev/tty`.
 - Never stores the sudo password in a file or command-line argument.
 - Creates a private temporary directory on each destination.
 - Verifies the uploaded archive with SHA-256 before installation.
-- Validates the gzip/tar archive before touching `/etc/letsencrypt`.
+- Copies the upload into a root-owned staging area and verifies it again, closing the unprivileged-upload race.
+- Rejects path traversal, special filesystem nodes, and symlinks that escape the staged tree.
+- Validates every live certificate, private key, expiry, and public-key match before installation.
+- Replaces the destination by same-filesystem rename and automatically rolls back on install or reload failure.
 - Preserves Let's Encrypt symlinks and numeric ownership.
 - Continues processing other hosts when one destination fails.
 - Returns a non-zero exit code if any destination fails.
@@ -33,12 +36,13 @@ Local private temporary archive
       |
       | SFTP over authenticated SSH
       v
-Remote private /tmp directory
+Remote private /tmp upload
       |
-      | SHA-256 + tar validation
+      | root-owned copy + second SHA-256 check
       v
-Remote sudo
+validated same-filesystem staging tree
       |
+      | atomic rename + optional service reload
       v
 /etc/letsencrypt
 ```
@@ -65,6 +69,8 @@ The script is normally executed with `sudo`.
 - `tar`
 - `sha256sum`
 - `mktemp`
+- `realpath`
+- `openssl`
 - SSH user with permission to run `sudo`
 
 ## Installation
@@ -72,7 +78,7 @@ The script is normally executed with `sudo`.
 Clone the repository:
 
 ```bash
-git clone https://github.com/YOUR-USER/letsencrypt-sftp-sync.git
+git clone https://github.com/mOhmd-r/Letsencrypt-SFTP-sync.git
 cd letsencrypt-sftp-sync
 ```
 
@@ -139,6 +145,9 @@ SFTP_BUFFER_SIZE=65536
 SFTP_REQUESTS=128
 
 GZIP_LEVEL=9
+
+# Optional: a validated systemd unit name, for example nginx.service
+RELOAD_SERVICE=
 ```
 
 They can be overridden with environment variables:
@@ -147,6 +156,7 @@ They can be overridden with environment variables:
 sudo \
   SSH_KEY=/home/dev/.ssh/cert_sync \
   KNOWN_HOSTS=/home/dev/.ssh/known_hosts \
+  RELOAD_SERVICE=nginx.service \
   ./sync_cert.sh targets.txt
 ```
 
@@ -173,8 +183,8 @@ Example flow:
   🔎 Validating archive...
   ✔ Archive valid
   📦 Installing certificates...
-  ✔ Certificates installed
-  ✔ Let's Encrypt structure verified
+  ✔ Certificates installed atomically
+  ✔ Certificate/key pairs verified
   ✅ Sync completed successfully
 ```
 
@@ -212,7 +222,7 @@ Host-key verification is mandatory. The script does not use `StrictHostKeyChecki
 
 ### SSH key
 
-The configured private key is forced to mode `0600` before use.
+The configured private key must already be a regular, non-symlink file with no group or other access. The script never silently changes its permissions. The key and `known_hosts` must be owned by root or the invoking sudo user; `known_hosts` must not be group- or world-writable.
 
 For production, using a dedicated certificate-sync SSH key is preferable to using a personal SSH identity.
 
@@ -258,15 +268,29 @@ umask 077
 mktemp -d
 ```
 
+The SFTP upload is never extracted with privilege. Root first copies it into a
+private directory on the destination filesystem and verifies the expected hash
+again. Validation and extraction occur there. The previous certificate tree is
+renamed aside immediately before the staged tree is renamed into place. If an
+optional systemd reload fails, the previous tree is restored and reloaded.
+
+SHA-256 detects transfer corruption; it is not a signature. Security still
+depends on the source host, SSH key, pinned host key, and remote root boundary.
+
 The directory is deleted after installation.
 
 ### Integrity
 
-The local SHA-256 digest is compared with the uploaded archive before extraction.
+The local SHA-256 digest is checked once as the SSH user after upload and again
+against the root-owned copy before extraction.
 
 ### Archive validation
 
-The uploaded archive is tested with:
+The uploaded archive is listed before extraction. Absolute and parent-directory
+paths are rejected. After extraction, special nodes and escaping symlinks are
+rejected, and each live certificate/key pair is cryptographically checked.
+
+The basic archive readability check uses:
 
 ```bash
 tar -tzf
@@ -286,7 +310,8 @@ That approach reduces the privilege available to the SSH account while keeping t
 - It does not skip unchanged certificates.
 - It does not perform incremental synchronization.
 - It does not modify Certbot renewal configuration.
-- It does not automatically reload Nginx, HAProxy, Kamailio, or other services.
+- It does not guess which service consumes the certificates; set the optional
+  \`RELOAD_SERVICE\` systemd unit explicitly when an atomic reload is required.
 
 Every execution transfers the complete Let's Encrypt archive.
 
