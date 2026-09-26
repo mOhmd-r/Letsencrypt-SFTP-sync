@@ -420,11 +420,12 @@ sync_host() {
 
     echo "  📦 Installing certificates..."
 
-    local certs_q archive_q hash_q reload_q
+    local certs_q archive_q hash_q reload_q include_renewal_q
     printf -v certs_q '%q' "$CERTS_DIR"
     printf -v archive_q '%q' "$remote_archive"
     printf -v hash_q '%q' "$ARCHIVE_SHA256"
     printf -v reload_q '%q' "$RELOAD_SERVICE"
+    printf -v include_renewal_q '%q' "$INCLUDE_RENEWAL_CONFIG"
 
     if ! remote_sudo \
         "$target" \
@@ -436,6 +437,7 @@ sync_host() {
         source_archive=$archive_q
         expected_hash=$hash_q
         reload_service=$reload_q
+        include_renewal=$include_renewal_q
         parent=\$(dirname \"\$certs_dir\")
         base=\$(basename \"\$certs_dir\")
         work=\$(mktemp -d \"\${parent}/.\${base}.work.XXXXXXXX\")
@@ -478,7 +480,7 @@ sync_host() {
             cp -a -- \"\$certs_dir/.\" \"\$stage/\"
         fi
         rm -rf -- \"\$stage/live\" \"\$stage/archive\"
-        if [[ "$INCLUDE_RENEWAL_CONFIG" == true ]]; then
+        if [[ \"\$include_renewal\" == true ]]; then
             rm -rf -- \"\$stage/renewal\"
         fi
         tar -xzf \"\$root_archive\" -C \"\$stage\" --no-same-owner --same-permissions
@@ -488,7 +490,7 @@ sync_host() {
 
         test -d \"\$stage/live\"
         test -d \"\$stage/archive\"
-        if [[ "$INCLUDE_RENEWAL_CONFIG" == true ]]; then
+        if [[ \"\$include_renewal\" == true ]]; then
             test -d \"\$stage/renewal\"
         else
             test ! -e \"\$stage/renewal\"
