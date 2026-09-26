@@ -8,8 +8,10 @@ set -Eeuo pipefail
 
 CERTS_DIR="${CERTS_DIR:-/etc/letsencrypt}"
 
-SSH_KEY="${SSH_KEY:-/home/dev/.ssh/id_ed25519}"
-KNOWN_HOSTS="${KNOWN_HOSTS:-/home/dev/.ssh/known_hosts}"
+INVOKING_USER="${SUDO_USER:-root}"
+INVOKING_HOME="$(getent passwd "$INVOKING_USER" 2>/dev/null | cut -d: -f6 || true)"
+SSH_KEY="${SSH_KEY:-${INVOKING_HOME}/.ssh/id_ed25519}"
+KNOWN_HOSTS="${KNOWN_HOSTS:-${INVOKING_HOME}/.ssh/known_hosts}"
 
 SSH_CONNECT_TIMEOUT="${SSH_CONNECT_TIMEOUT:-10}"
 
@@ -21,6 +23,7 @@ SFTP_REQUESTS="${SFTP_REQUESTS:-128}"
 # Strong compression is useful when the network is slower than local CPU.
 GZIP_LEVEL="${GZIP_LEVEL:-9}"
 RELOAD_SERVICE="${RELOAD_SERVICE:-}"
+INCLUDE_RENEWAL_CONFIG="${INCLUDE_RENEWAL_CONFIG:-false}"
 
 IPS_FILE="${1:-}"
 
@@ -73,6 +76,7 @@ Optional environment overrides:
   SFTP_BUFFER_SIZE
   SFTP_REQUESTS
   GZIP_LEVEL
+  INCLUDE_RENEWAL_CONFIG  false by default; true also transfers renewal/
   RELOAD_SERVICE        Optional systemd unit reloaded after an atomic swap
 
 EOF
@@ -467,6 +471,16 @@ sync_host() {
             case \"/\$member/\" in */../*) exit 42 ;; esac
         done < <(tar -tzf \"\$root_archive\")
 
+        # Preserve destination-local content (for example ACME account state
+        # and provider credentials) without ever transferring it from source.
+        if [[ -e \"\$certs_dir\" ]]; then
+            [[ -d \"\$certs_dir\" && ! -L \"\$certs_dir\" ]]
+            cp -a -- \"\$certs_dir/.\" \"\$stage/\"
+        fi
+        rm -rf -- \"\$stage/live\" \"\$stage/archive\"
+        if [[ "$INCLUDE_RENEWAL_CONFIG" == true ]]; then
+            rm -rf -- \"\$stage/renewal\"
+        fi
         tar -xzf \"\$root_archive\" -C \"\$stage\" --no-same-owner --same-permissions
         chmod -R u-s,g-s \"\$stage\"
         rm -rf -- \"\$work\"
@@ -474,7 +488,11 @@ sync_host() {
 
         test -d \"\$stage/live\"
         test -d \"\$stage/archive\"
-        test -d \"\$stage/renewal\"
+        if [[ "$INCLUDE_RENEWAL_CONFIG" == true ]]; then
+            test -d \"\$stage/renewal\"
+        else
+            test ! -e \"\$stage/renewal\"
+        fi
         unexpected=\$(find \"\$stage\" ! -type f ! -type d ! -type l -print -quit)
         [[ -z \"\$unexpected\" ]]
         while IFS= read -r link; do
@@ -510,9 +528,13 @@ sync_host() {
         if [[ -n \"\$reload_service\" ]]; then
             systemctl reload \"\$reload_service\"
         fi
-        [[ -z \"\$old\" || ! -e \"\$old\" ]] || rm -rf -- \"\$old\"
+        # Validation and reload succeeded. Commit before pruning the old tree so
+        # cleanup failure cannot restore partially deleted data.
         installed=false
         trap - EXIT
+        if [[ -n \"\$old\" && -e \"\$old\" ]] && ! rm -rf -- \"\$old\"; then
+            printf 'WARNING: installed certificates are active, but old tree cleanup failed: %s\\n' \"\$old\" >&2
+        fi
         "; then
 
         echo -e "  ${RED}❌ Certificate installation failed${NC}"
@@ -596,6 +618,14 @@ fi
     echo -e "${RED}❌ Invalid systemd unit name: $RELOAD_SERVICE${NC}"
     exit 1
 }
+[[ "$INCLUDE_RENEWAL_CONFIG" == "true" || "$INCLUDE_RENEWAL_CONFIG" == "false" ]] || {
+    echo -e "${RED}❌ INCLUDE_RENEWAL_CONFIG must be true or false.${NC}"
+    exit 1
+}
+[[ -n "$INVOKING_HOME" ]] || {
+    echo -e "${RED}❌ Could not determine the invoking user's home directory; set SSH_KEY and KNOWN_HOSTS explicitly.${NC}"
+    exit 1
+}
 
 for cmd in ssh sftp ssh-keygen tar gzip sha256sum mktemp stat; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
@@ -636,10 +666,22 @@ echo
 
 echo "📦 Creating certificate archive..."
 
-tar \
-    -C "$CERTS_DIR" \
-    -cf - \
-    . |
+archive_members=(live archive)
+for required_tree in "${archive_members[@]}"; do
+    [[ -d "${CERTS_DIR}/${required_tree}" && ! -L "${CERTS_DIR}/${required_tree}" ]] || {
+        echo -e "${RED}❌ Required certificate tree is missing or symlinked: ${CERTS_DIR}/${required_tree}${NC}"
+        exit 1
+    }
+done
+if [[ "$INCLUDE_RENEWAL_CONFIG" == "true" ]]; then
+    [[ -d "${CERTS_DIR}/renewal" && ! -L "${CERTS_DIR}/renewal" ]] || {
+        echo -e "${RED}❌ Renewal configuration tree is missing or symlinked.${NC}"
+        exit 1
+    }
+    archive_members+=(renewal)
+fi
+
+tar -C "$CERTS_DIR" -cf - -- "${archive_members[@]}" |
 gzip "-$GZIP_LEVEL" > "$ARCHIVE"
 
 while IFS= read -r member; do
